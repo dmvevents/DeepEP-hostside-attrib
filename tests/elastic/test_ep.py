@@ -578,7 +578,8 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     dist.destroy_process_group()
 
 
-if __name__ == '__main__':
+def build_parser() -> argparse.ArgumentParser:
+    """Build the CLI parser (shared with tests/elastic/test_ep_torchrun.py)."""
     parser = argparse.ArgumentParser(description='Test elastic EP kernels')
 
     # Resource settings
@@ -621,6 +622,11 @@ if __name__ == '__main__':
     parser.add_argument('--masked-ratio', type=float, default=0.0, help='Mask some expert selections')
     parser.add_argument('--dump-profile-traces', type=str, default='', help='Dump profiling trace JSONs')
     parser.add_argument('--ignore-local-traffic', action='store_true', help='Whether to ignore local traffic during bandwidth calculation')
+    return parser
+
+
+if __name__ == '__main__':
+    parser = build_parser()
     args = parser.parse_args()
     if args.pressure_iterations < 0:
         parser.error("--pressure-iterations must be non-negative")
