@@ -363,6 +363,25 @@ hybrid_combine_impl(nv_bfloat16* x,
         constexpr int kNumForwardMetadataDims = 2 + kNumTopk * 2;
         token_metadata_at_forward += channel_idx * ((kNumScaleoutRanks * kNumMaxTokensPerChannel + 1) * kNumForwardMetadataDims);
 
+        // NH-A2: count-gated completion with ONE terminal STRONG signal per (channel, remote peer) instead of NH-A's
+        // per-put SignalAdd (the deprecated `ncclGin_SignalAdd` is WEAK unless `ginStrongSignalsRequired`, which this tree
+        // never set: gin_host.cc:255). `ncclGin_StrongSignalAdd`: "visibility implies all preceding puts are settled"
+        // (nccl_device/gin.h:59; put(): "this put AND all preceding puts on this context to the same peer"). The peer's
+        // return puts for this channel travel on this warp's context (`get_qp_mode` is rank-independent) and its terminal
+        // signal follows them on the same context, so `readSignal >= target` gates the data with no sender-side flush and
+        // no dispatch-side expected-count tables (NH-A's per-buffer table and its G3 scope limit are gone). The signal-only
+        // op is non-aggregate (default flags): on a device-posting backend it also rings a doorbell deferred by
+        // AggregateRequests puts; on the proxy backend the device flag is never transported (gin_proxy.h buildGfd).
+        EP_STATIC_ASSERT((comm::constexpr_max_qp_channel_slots<kNumSMs, kNumQPs, kNumChannelsPerSM>() <=
+                          layout::WorkspaceLayout::kNumNHACombineSignalSlots), "NH-A2: channel/QP shape exceeds the indexed-signal budget");
+        const auto nha_signal_id = static_cast<ncclGinSignal_t>(
+            kNumRanks + 4 + comm::get_qp_channel_slot<kNumSMs, kNumQPs, kNumChannelsPerSM>(sm_idx, forward_warp_idx));
+        // Local-completion point for `scaleout_send_buffer` reuse stays AFTER the wait (hazard i; G4 reuse probe).
+        constexpr bool kNHAFlushAfterWait = true;
+        // Every remote scale-out peer sends exactly one terminal signal per channel per launch, unconditionally (as the
+        // baseline's per-peer `red_add_rel` did), so the expected count is a compile-time constant.
+        constexpr int nha_expected = kNumScaleoutRanks - 1;
+
         // Overlap TMA stores and reduction
         int last_src_scaleout_rank_idx = -1;
         int last_is_token_last_in_chunk = 0;
@@ -575,6 +594,24 @@ hybrid_combine_impl(nv_bfloat16* x,
         if constexpr (kAllowMultipleReduction)
             flush_last_tma_and_issue_rdma();
 
+        // NH-A2: one terminal signal per remote scale-out peer on this channel's context, AFTER this warp's last put to it.
+        // Strong-capable backend (the measured PROXY backend reports supportsStrongSignals = true, gin_host_proxy.cc:348): a
+        // STRONG signal is visible at the peer only once all preceding puts on this context to that peer are settled
+        // (gin.h:59) -- exactly the wait's data-completion contract, with no sender-side flush on the peers' critical path
+        // (the baseline flushed here). Otherwise the API rule applies (gin_device_common.h:190-192): flush first, then a WEAK
+        // signal carries the same guarantee -- so the fallback never asks a weak-only backend to lower a strong action.
+        const bool nha_strong = gin.gin._supportsStrongSignal();   // warp-uniform: a per-context constant
+        if (not nha_strong)
+            gin.flush<ncclCoopWarp>();
+        __syncwarp();
+        if (lane_idx < kNumScaleoutRanks and lane_idx != scaleout_rank_idx) {
+            if (nha_strong)
+                gin.signal<ncclTeamTagRail>(lane_idx, ncclGin_StrongSignalAdd{nha_signal_id, static_cast<uint64_t>(1)});
+            else
+                gin.signal<ncclTeamTagRail>(lane_idx, ncclGin_WeakSignalAdd{nha_signal_id, static_cast<uint64_t>(1)});
+        }
+        __syncwarp();
+
         // Clean scaleup tails
         #pragma unroll
         for (int j = 0; j < kNumScaleupRanksPerLane; ++ j) {
@@ -584,39 +621,33 @@ hybrid_combine_impl(nv_bfloat16* x,
         }
         __syncwarp();
 
-        // Update, wait and clean
+        // NH-A2: count-gated wait (unchanged from NH-A). `target` is shadow-relative (the shadow is bumped by this launch's
+        // constant expected count); the read is acquire-ordered on the GIN context the peers' puts + terminal signals use.
         EP_STATIC_ASSERT(kNumScaleoutRanks <= 32, "Invalid ranks");
-        const auto expected_signal = math::pack2<int, int64_t>(1, 0);
-        gin.flush<ncclCoopWarp>();
-        if (lane_idx < kNumScaleoutRanks) {
-            // Update remote tails
-            gin.red_add_rel<ncclTeamTagRail>(
-                workspace_layout.get_scaleout_channel_signaled_tail_ptr(channel_idx, scaleout_rank_idx),
-                expected_signal, lane_idx);
-        }
-        __syncwarp();
-
-        // Wait tail arrival
-        if (lane_idx < kNumScaleoutRanks) {
-            const auto wait_ptr = workspace_layout.get_scaleout_channel_signaled_tail_ptr(channel_idx, lane_idx);
+        if (ptx::elect_one_sync()) {
+            const auto shadow_ptr = gin.gin.getSignalShadowPtr(nha_signal_id);
+            const auto target = (*shadow_ptr += static_cast<uint64_t>(nha_expected));
             comm::timeout_while<kNumTimeoutCycles>([=](const bool& is_last_check) {
-                const auto signal = ptx::ld_acquire_sys<int64_t>(wait_ptr);
-                if (signal == expected_signal) {
-                    // Clean for next usages
-                    *wait_ptr = 0;
+                const auto signal = gin.gin.readSignal(nha_signal_id, 64, cuda::memory_order_acquire);
+                if (signal >= target)
                     return true;
-                }
 
                 if (is_last_check) {
-                    printf("DeepEP combine (scale-out wait all) timeout, scale-out: %d/%d, scale-up: %d/%d, "
-                           "channel: %d, lane: %d, signal: %lld, expected: %lld\n",
+                    printf("DeepEP combine (NH-A2 count-gated wait) timeout, scale-out: %d/%d, scale-up: %d/%d, "
+                           "channel: %d, signal id: %d, signal: %llu, target: %llu, expected this launch: %d\n",
                            scaleout_rank_idx, kNumScaleoutRanks, scaleup_rank_idx, kNumScaleupRanks,
-                           channel_idx, lane_idx,
-                           signal, expected_signal);
+                           channel_idx, static_cast<int>(nha_signal_id),
+                           static_cast<unsigned long long>(signal), static_cast<unsigned long long>(target), nha_expected);
                 }
                 return false;
             });
         }
+        __syncwarp();
+
+        // Local completion of this warp's own puts (protects `scaleout_send_buffer` reuse, hazard i) -- now behind the
+        // wait, so no peer's critical path depends on it.
+        if constexpr (kNHAFlushAfterWait)
+            gin.flush<ncclCoopWarp>();
         __syncwarp();
     }
 

@@ -85,6 +85,30 @@ __device__ __forceinline__ std::pair<int, ncclGinResourceSharingMode> get_qp_mod
     }
 }
 
+// NH-A: 0-based slot of a DATA channel among the channels sharing its QP under `get_qp_mode` (no notify warps).
+// Channels on one QP differ in the quotient the modulo mapping discards, so (qp, slot) is unique per channel.
+template <int kNumSMs, int kNumQPs, int kNumChannelsPerSM>
+__device__ __forceinline__ int get_qp_channel_slot(const int& sm_idx, const int& channel_in_sm_idx) {
+    if constexpr (kNumQPs == 1)
+        return sm_idx * kNumChannelsPerSM + channel_in_sm_idx;
+    if constexpr (kNumSMs <= kNumQPs) {
+        const int num_qps_in_sm = (kNumQPs / kNumSMs) + (sm_idx < (kNumQPs % kNumSMs));
+        return channel_in_sm_idx / num_qps_in_sm;
+    } else {
+        return (sm_idx * kNumChannelsPerSM + channel_in_sm_idx) / kNumQPs;
+    }
+}
+
+// NH-A: upper bound of `get_qp_channel_slot` + 1 for the static signal-budget check
+template <int kNumSMs, int kNumQPs, int kNumChannelsPerSM>
+__host__ __device__ constexpr int constexpr_max_qp_channel_slots() {
+    if (kNumQPs == 1)
+        return kNumSMs * kNumChannelsPerSM;
+    if (kNumSMs <= kNumQPs)
+        return (kNumChannelsPerSM + (kNumQPs / kNumSMs) - 1) / (kNumQPs / kNumSMs);
+    return (kNumSMs * kNumChannelsPerSM + kNumQPs - 1) / kNumQPs;
+}
+
 template <int kNumRanks, int kNumSMs, int kNumThreads, int64_t kNumTimeoutCycles, int kTag = kDeviceBarrierTag>
 __forceinline__ __device__ void nvlink_barrier_wo_local_sync(
     const handle::NCCLGin& gin,

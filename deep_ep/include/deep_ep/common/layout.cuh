@@ -22,6 +22,9 @@ struct WorkspaceLayout {
     static constexpr int kNumMaxInflightAGRS = 32;
 
     static constexpr int64_t kNumBarrierSignalBytes = 16;
+    // NH-A2 (count-gated ordered combine, terminal strong signal): indexed-signal budget reserved per GIN context
+    // after the barrier (num_ranks) and PP (4) signals. Slot ids: num_ranks + 4 + get_qp_channel_slot(channel).
+    static constexpr int kNumNHACombineSignalSlots = 8;
 
     __forceinline__ __device__ __host__
     WorkspaceLayout(void* workspace,

@@ -9,6 +9,7 @@
 #include <nccl_device/core.h>
 
 #include <deep_ep/common/compiled.cuh>
+#include <deep_ep/common/layout.cuh>
 #include <deep_ep/common/exception.cuh>
 
 #include "api.cuh"
@@ -94,7 +95,12 @@ NCCLSymmetricMemoryContext::NCCLSymmetricMemoryContext(const int64_t& nccl_comm,
         reqs.ginQueueDepth = kGinQPDepth;
         reqs.ginTrafficClass = sl_idx;
         // Customized RDMA barrier needs extra signals
-        reqs.ginSignalCount = num_ranks + 2 * 2;
+        // NH-A2: + per-channel indexed counting signals for the count-gated ordered combine (ids num_ranks+4 ..);
+        // the wait counts ONE terminal strong signal per remote peer per channel (hybrid_combine.cuh).
+        reqs.ginSignalCount = num_ranks + 2 * 2 + deep_ep::elastic::layout::WorkspaceLayout::kNumNHACombineSignalSlots;
+        if (get_env<int>("EP_BUFFER_DEBUG"))
+            printf("EP NH-A2 terminal strong-signal ordered combine: %d extra indexed signals per GIN context\n",
+                   deep_ep::elastic::layout::WorkspaceLayout::kNumNHACombineSignalSlots);
         reqs.ginConnectionType = allow_hybrid_mode ? NCCL_GIN_CONNECTION_RAIL: NCCL_GIN_CONNECTION_FULL;
     }
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2, 31, 0)
