@@ -6,6 +6,10 @@ import torch.distributed as dist
 import deep_ep.comm.handle as comm_mod
 from deep_ep.comm.handle import get_nccl_comm_handle
 
+# Every collective `get_nccl_comm_handle` could reach. Each call is recorded, so the
+# tests can tell exactly which collectives a path runs.
+_COLLECTIVES = ('all_gather_object', 'all_gather', 'all_reduce', 'barrier', 'broadcast', 'broadcast_object_list')
+
 
 class _FakeBackend:
 
@@ -38,100 +42,90 @@ class _FakeGroup:
         return self is other
 
 
-def _run(local_ptr: int, gathered_flags, reuse: str = '1'):
-    """Drive get_nccl_comm_handle with a faked group.
+def _call(group, calls, **kwargs):
+    """Call get_nccl_comm_handle with every collective recorded into `calls`."""
 
-    `gathered_flags` is what the decision all_gather returns (one bool per rank). Returns the
-    handle, the objects contributed to all_gather_object, and the group, so a caller can make a
-    second (cache-hitting) call on the same group.
-    """
+    def recorder(name):
+
+        def collective(*args, **_kwargs):
+            if name == 'all_gather_object':
+                # The unique-id exchange on the create-our-own path
+                out_list, obj = args[0], args[1]
+                calls.append((name, obj))
+                out_list[:] = [b'fake-unique-id'] * len(out_list)
+            else:
+                calls.append((name, None))
+
+        return collective
+
+    patches = [mock.patch.object(dist, name, recorder(name)) for name in _COLLECTIVES]
+    patches += [
+        mock.patch.object(comm_mod._C, 'get_local_nccl_unique_id', create=True, return_value=b'fake-unique-id'),
+        mock.patch.object(comm_mod._C, 'create_nccl_comm', create=True, return_value=0xDEADBEEF),
+        mock.patch.object(comm_mod._C, 'destroy_nccl_comm', create=True, return_value=None),
+    ]
+    for p in patches:
+        p.start()
+    try:
+        return get_nccl_comm_handle(group, **kwargs)
+    finally:
+        for p in reversed(patches):
+            p.stop()
+
+
+def _run(local_ptr: int, reuse: str = '1'):
+    """Return the handle, the collectives it ran, and the group (for a second, cache-hitting call)."""
     comm_mod._storage.clear()
     os.environ['EP_REUSE_NCCL_COMM'] = reuse
     group = _FakeGroup(_FakeBackend(local_ptr))
     calls = []
-
-    def fake_all_gather_object(out_list, obj, _group):
-        calls.append(obj)
-        if isinstance(obj, bool):
-            out_list[:] = gathered_flags
-        else:
-            # unique-id gather on the create-our-own path
-            out_list[:] = [b'fake-unique-id'] * len(out_list)
-
-    with mock.patch.object(dist, 'all_gather_object', fake_all_gather_object), \
-         mock.patch.object(comm_mod._C, 'get_local_nccl_unique_id', create=True, return_value=b'fake-unique-id'), \
-         mock.patch.object(comm_mod._C, 'create_nccl_comm', create=True, return_value=0xDEADBEEF), \
-         mock.patch.object(comm_mod._C, 'destroy_nccl_comm', create=True, return_value=None):
-        handle = get_nccl_comm_handle(group)
+    handle = _call(group, calls)
     return handle, calls, group
 
 
-def test_all_ranks_have_comm_reuses():
-    handle, calls, _ = _run(local_ptr=0x1234, gathered_flags=[True, True])
+def test_live_comm_is_reused_without_a_collective():
+    handle, calls, _ = _run(local_ptr=0x1234)
     assert handle.get() == 0x1234
     assert not handle.managed
-    # Exactly one collective: the decision gather (no unique-id exchange).
-    assert calls == [True]
+    # No collective at all: a rank that reaches this alone (e.g. through a size or
+    # topology helper) returns instead of waiting for its peers.
+    assert calls == []
 
 
-def test_null_local_ptr_creates_managed_comm():
-    handle, calls, _ = _run(local_ptr=0, gathered_flags=[False, False])
-    assert handle.get() == 0xDEADBEEF
+def test_null_comm_creates_managed_comm():
+    handle, calls, _ = _run(local_ptr=0)
+    assert handle.get() == 0xDEADBEEF, 'a null `_comm_ptr()` must never be reused'
     assert handle.managed
-    # Decision gather ran first (reached even with a null local pointer), then the
-    # unique-id gather on the fall-through path.
-    assert calls[0] is False
-    assert len(calls) == 2
+    # The only collective is the unique-id exchange of the create-our-own path.
+    assert calls == [('all_gather_object', b'fake-unique-id')]
 
 
-def test_rank_skew_takes_fallthrough_on_every_rank():
-    # This rank holds a live comm, but a peer does not: must NOT reuse, must proceed to the
-    # same create-our-own path the null rank takes.
-    handle, calls, _ = _run(local_ptr=0x1234, gathered_flags=[True, False])
-    assert handle.get() == 0xDEADBEEF
-    assert handle.managed
-    assert calls[0] is True
-    assert len(calls) == 2
-
-
-def test_env_hatch_disables_reuse_even_when_all_ranks_live():
-    # `EP_REUSE_NCCL_COMM=0` is the documented escape hatch for the reuse path, and it must win
-    # even when every rank reports a live pointer. Without this case, replacing the getenv lookup
-    # with a literal `True` leaves the rest of this file green: the hatch had no coverage at all.
+def test_env_hatch_disables_reuse_even_when_comm_is_live():
+    # `EP_REUSE_NCCL_COMM=0` must win even when a live pointer is available.
     try:
-        handle, calls, _ = _run(local_ptr=0x1234, gathered_flags=[True, True], reuse='0')
+        handle, calls, _ = _run(local_ptr=0x1234, reuse='0')
         assert handle.managed, 'EP_REUSE_NCCL_COMM=0 must force a DeepEP-managed comm'
         assert handle.get() != 0x1234, 'must not borrow PyTorch\'s comm when reuse is off'
-        # The reuse-disabled path skips the nullness decision entirely: only the unique-id
-        # gather runs, so no boolean is ever contributed.
-        assert all(not isinstance(c, bool) for c in calls)
+        assert calls == [('all_gather_object', b'fake-unique-id')]
     finally:
         os.environ['EP_REUSE_NCCL_COMM'] = '1'
 
 
-def test_cache_hit_bypasses_the_decision_collective():
-    # The cache check sits above the decision collective, so a cache hit runs no collective at
-    # all. That is correct when every rank calls this helper uniformly, and a hang if they do
-    # not, so the guarantee is pinned here rather than left implied.
-    first, calls1, group = _run(local_ptr=0x1234, gathered_flags=[True, True])
-    assert calls1 == [True]
+def test_cache_hit_runs_no_collective():
+    # The cache check sits above the unique-id exchange, so a second call on the
+    # same group returns the cached managed comm without any collective.
+    first, calls1, group = _run(local_ptr=0)
+    assert calls1 == [('all_gather_object', b'fake-unique-id')]
 
     calls2 = []
-
-    def counting_gather(out_list, obj, _group):
-        calls2.append(obj)
-        out_list[:] = [True] * len(out_list)
-
-    with mock.patch.object(dist, 'all_gather_object', counting_gather):
-        second = get_nccl_comm_handle(group)
+    second = _call(group, calls2)
     assert second is first, 'the cache must return the same handle'
-    assert calls2 == [], 'a cache hit runs no collective, so callers must be group-uniform'
+    assert calls2 == []
 
 
 if __name__ == '__main__':
-    test_all_ranks_have_comm_reuses()
-    test_null_local_ptr_creates_managed_comm()
-    test_rank_skew_takes_fallthrough_on_every_rank()
-    test_env_hatch_disables_reuse_even_when_all_ranks_live()
-    test_cache_hit_bypasses_the_decision_collective()
+    test_live_comm_is_reused_without_a_collective()
+    test_null_comm_creates_managed_comm()
+    test_env_hatch_disables_reuse_even_when_comm_is_live()
+    test_cache_hit_runs_no_collective()
     print('All comm-reuse tests passed')
