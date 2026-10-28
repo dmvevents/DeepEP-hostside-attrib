@@ -20,6 +20,10 @@ class _FakeBackend:
         return self._ptr
 
 
+class _NoCommPtrBackend:
+    """A backend from a PyTorch build without `_comm_ptr()`."""
+
+
 class _FakeGroup:
     """Stands in for a 2-rank ProcessGroup; collectives are monkeypatched."""
 
@@ -42,7 +46,7 @@ class _FakeGroup:
         return self is other
 
 
-def _call(group, calls, **kwargs):
+def _call(group, calls, reuse: str = '1', **kwargs):
     """Call get_nccl_comm_handle with every collective recorded into `calls`."""
 
     def recorder(name):
@@ -58,7 +62,8 @@ def _call(group, calls, **kwargs):
 
         return collective
 
-    patches = [mock.patch.object(dist, name, recorder(name)) for name in _COLLECTIVES]
+    patches = [mock.patch.dict(os.environ, {'EP_REUSE_NCCL_COMM': reuse})]
+    patches += [mock.patch.object(dist, name, recorder(name)) for name in _COLLECTIVES]
     patches += [
         mock.patch.object(comm_mod._C, 'get_local_nccl_unique_id', create=True, return_value=b'fake-unique-id'),
         mock.patch.object(comm_mod._C, 'create_nccl_comm', create=True, return_value=0xDEADBEEF),
@@ -76,10 +81,9 @@ def _call(group, calls, **kwargs):
 def _run(local_ptr: int, reuse: str = '1'):
     """Return the handle, the collectives it ran, and the group (for a second, cache-hitting call)."""
     comm_mod._storage.clear()
-    os.environ['EP_REUSE_NCCL_COMM'] = reuse
     group = _FakeGroup(_FakeBackend(local_ptr))
     calls = []
-    handle = _call(group, calls)
+    handle = _call(group, calls, reuse=reuse)
     return handle, calls, group
 
 
@@ -102,13 +106,10 @@ def test_null_comm_creates_managed_comm():
 
 def test_env_hatch_disables_reuse_even_when_comm_is_live():
     # `EP_REUSE_NCCL_COMM=0` must win even when a live pointer is available.
-    try:
-        handle, calls, _ = _run(local_ptr=0x1234, reuse='0')
-        assert handle.managed, 'EP_REUSE_NCCL_COMM=0 must force a DeepEP-managed comm'
-        assert handle.get() != 0x1234, 'must not borrow PyTorch\'s comm when reuse is off'
-        assert calls == [('all_gather_object', b'fake-unique-id')]
-    finally:
-        os.environ['EP_REUSE_NCCL_COMM'] = '1'
+    handle, calls, _ = _run(local_ptr=0x1234, reuse='0')
+    assert handle.managed, 'EP_REUSE_NCCL_COMM=0 must force a DeepEP-managed comm'
+    assert handle.get() != 0x1234, 'must not borrow PyTorch\'s comm when reuse is off'
+    assert calls == [('all_gather_object', b'fake-unique-id')]
 
 
 def test_cache_hit_runs_no_collective():
@@ -123,9 +124,28 @@ def test_cache_hit_runs_no_collective():
     assert calls2 == []
 
 
+def test_force_new_comm_never_reuses_or_hits_the_cache():
+    cached, _, group = _run(local_ptr=0x1234)
+    calls = []
+    fresh = _call(group, calls, force_new_comm=True)
+    assert fresh is not cached and fresh.managed
+    assert calls == [('all_gather_object', b'fake-unique-id')]
+    assert comm_mod._storage[group] is cached, 'a forced comm must not replace the cached one'
+
+
+def test_backend_without_comm_ptr_creates_managed_comm():
+    comm_mod._storage.clear()
+    calls = []
+    handle = _call(_FakeGroup(_NoCommPtrBackend()), calls)
+    assert handle.managed
+    assert calls == [('all_gather_object', b'fake-unique-id')]
+
+
 if __name__ == '__main__':
     test_live_comm_is_reused_without_a_collective()
     test_null_comm_creates_managed_comm()
     test_env_hatch_disables_reuse_even_when_comm_is_live()
     test_cache_hit_runs_no_collective()
+    test_force_new_comm_never_reuses_or_hits_the_cache()
+    test_backend_without_comm_ptr_creates_managed_comm()
     print('All comm-reuse tests passed')

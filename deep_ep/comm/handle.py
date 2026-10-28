@@ -70,14 +70,13 @@ def get_nccl_comm_handle(group: dist.ProcessGroup, force_new_comm: bool = False)
     if not force_new_comm and hasattr(backend, '_comm_ptr') and int(os.getenv('EP_REUSE_NCCL_COMM', '1')):
         # PyTorch creates NCCL communicators lazily: `_comm_ptr()` returns 0 until a
         # collective has run on this group and device (or `init_process_group` got
-        # `device_id=...`). A null handle would crash later in C++ (`ncclTeamWorld`
-        # reads `comm->nRanks`), so it is never reused.
-        # Ranks agree on this without a collective: PyTorch creates a group's
-        # communicator collectively, so every rank whose current device is the one it
-        # uses for the group sees the same result (unbatched send/recv use separate
-        # 2-rank communicators and do not change it). Keeping this path free of
-        # collectives also keeps calls such as `get_physical_domain_size(group)` local
-        # once PyTorch's communicator exists, as they were before this check.
+        # `device_id=...`), and a null handle would crash in C++ (`ncclTeamWorld`).
+        # No collective is needed to agree on this: PyTorch creates a group's
+        # communicator collectively, so ranks whose current device is the one PyTorch
+        # used for the group all see the same result. That fails if the group's first
+        # op ran on another device (e.g. `barrier()` without `device_ids`); use
+        # `EP_REUSE_NCCL_COMM=0` there. Staying collective-free keeps calls such as
+        # `get_physical_domain_size(group)` local when PyTorch's comm exists.
         comm_ptr = backend._comm_ptr()
         if comm_ptr != 0:
             _storage[group] = NCCLCommHandle(comm_ptr, False)
