@@ -451,6 +451,8 @@ These flags affect `bench_kineto` in [deep_ep/utils/testing.py](deep_ep/utils/te
 
 DeepEP is fully tested with InfiniBand networks. However, it is theoretically compatible with RDMA over Converged Ethernet (RoCE) as well.
 
+DeepEP uses NCCL's Gin GDAKI backend when it is available, and otherwise NCCL's Gin proxy backend (e.g. on AWS EFA). Set `NCCL_GIN_TYPE=2` to force the proxy backend. Backends without strong and VA signals, such as `EFA_GDA`, are not supported.
+
 ### Traffic isolation
 
 Traffic isolation is supported by InfiniBand through Virtual Lanes (VL).

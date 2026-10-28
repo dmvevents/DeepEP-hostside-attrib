@@ -126,12 +126,19 @@ Context::Context(const int64_t& nccl_comm, const symmetric::shared_comm_t& share
             (allow_hybrid_mode ? props.railedGinType : props.ginType) != NCCL_GIN_TYPE_NONE and
             "NCCL GIN is unavailable. This is usually due to a network configuration issue, "
             "such as `allow_hybrid_mode=0` (disable direct RDMA kernels) in multi-plane network.");
+
+        // Prefer GDAKI, otherwise use the proxy backend (e.g. AWS EFA)
+        // NOTES: the kernels require strong and VA signals, which both backends support
+        const auto gin_type = props.ginSupport[NCCL_GIN_TYPE_GDAKI] ? NCCL_GIN_TYPE_GDAKI : NCCL_GIN_TYPE_PROXY;
         EP_HOST_ASSERT(
-            props.ginSupport[NCCL_GIN_TYPE_GDAKI] and
-            "NCCL GDAKI is unavailable for this communicator.");
+            props.ginSupport[gin_type] and
+            "Neither NCCL GDAKI nor the NCCL Gin proxy is available for this communicator.");
+        set_jit_gin_type(gin_type);
+        if (get_env<int>("EP_BUFFER_DEBUG"))
+            printf("EP NCCL device communicator uses Gin type %d\n", static_cast<int>(gin_type));
 
         gin_min_stride = props.ginMinStride;
-        reqs.ginType = NCCL_GIN_TYPE_GDAKI;
+        reqs.ginType = gin_type;
         reqs.ginContextCount = num_allocated_qps;
         reqs.ginExclusiveContexts = true;
         reqs.ginQueueDepth = qp_depth > 0 ? qp_depth : kDefaultQPDepth;
